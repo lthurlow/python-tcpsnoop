@@ -4,7 +4,6 @@ import datetime
 import time
 import os
 import logging
-import logging.handlers
 import pprint
 import threading
 import pdb
@@ -95,6 +94,7 @@ else:
 # if we do it like this, this means that src->dst is different than dst->src
 
 def snoop_data(pkt):
+  logger.debug("SNOOP_DATA")
   global dcache
   global lastseq
   global transmit
@@ -107,20 +107,27 @@ def snoop_data(pkt):
   # ('Timestamp',(Num,0))
   ts = sp["TCP"].getfieldval('options')[2][1][0]
   flow = (ips,ports)
+
+  logger.debug("\tcurrent flow: %s" % flow)
   ## this will be used when access the lastack dict for acks to our seqs
   inv_flow = ((ips[1],ips[0]),(ips[1],ips[0]))
 
+  logger.debug("\tlastack: %s" % lastseq)
   ## start by setting up the flow information
   if flow not in lastseq:
+    logger.debug("flow not in lastack.")
     lastseq[flow] = (seqnum,ts)
     ## this also implies 1. as it is first packet in flow, not just not seen
     ## cache it
     dcache[(flow,seqnum)].append(sp)
+    logger.debug("pkt added to cache")
+    logger.debug("\tdata cache: %s" % dcache)
     ## forward it
     pkt.accept()
   ## we have atleast seen 1 packet recently from source/dst
   else:
     ## case 1
+    logger.debug("flow has been seen before")
     if lastseq[flow][0] > seqnum:
       ## we have not recieved an ack from our src/dst, this is bad.
       ## in the 3 way handshake, SYN should hit above logic, SYN/ACK
@@ -129,17 +136,29 @@ def snoop_data(pkt):
         ## of a tcp seq number overflow
         prev_ack = acache[inv_flow].getfieldval('ack')
         if seqnum > prev_ack or ts > lastseq[flow][1]:
+          logger.debug("normal pkt, accept, and cache")
           lastseq[flow] = seqnum
           dcache[(flow,seqnum)] = sp
           pkt.accept()
+        else:
+          logger.debug("sequence number lower or timestamp less, packet thrown")
+      else:
+        logger.error("inverse flow is not in a-cache, this is bad.")
+        logger.error("logic should prevent this.")
     else:
       ## case 2b
-      if sp in dcache[(flow,seqnum)]:
+      if sp == dcache[(flow,seqnum)]:
+        logger.debug("recieved old data pkt, resending last ack back to sender")
         ## using scapy here to inject our last ack seen back to FH
-        send(lastack[inv_flow])
+        #send(lastack[inv_flow])
+        #FIXME: need a way to correlate the missing ack in acache
+        send(acache[inv_flow])
       ## case 3
       ## there was loss on our FH link, and congestion
       else:
+        logger.debug("loss on link, accepting data packet, modifying transmit")
+        logger.debug("transmit: %s" % transmit[flow])
+        ##FIXME: this needs to be used by snoop_ack
         transmit[flow].append(sp)
         pkt.accept()
   
