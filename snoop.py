@@ -43,6 +43,17 @@ logger.setLevel(logging.DEBUG)
 """
 sudo iptables -I INPUT -p tcp -i eth1 -j NFQUEUE --queue-num 1
 sudo iptables -I OUTPUT -p tcp -o eth1 -j NFQUEUE --queue-num 1
+
+sudo iptables -I INPUT -p tcp -i eth1 -j NFQUEUE --queue-num 1
+sudo iptables -I OUTPUT -p tcp -o eth2 -m statistic --mode random --probability 0.2 -j DROP
+
+
+ANHOST2:
+sudo iptables -I FORWARD -p tcp -i eth1 -j NFQUEUE --queue-num 1
+sudo iptables -A OUTPUT -p tcp -o eth2 -j NFQUEUE --queue-num 1
+
+ANHOST3:
+sudo iptables -I INPUT -i eth2 -m statistic --mode random --probability 0.2 -j DROP
 """
 
 
@@ -93,7 +104,7 @@ def accept_packet(pkt,flow,ts,num,ack_flag):
     dcache.pop((flow,num-1),None)
   else:
     dcache[(flow,num)] = sp
-    lastseq[flow] = (num,ts)
+    lastseq[flow] = (int(num),int(ts))
     ## we could do this for all, but for now assumption is reciever is bad not sender
     transmit[(flow, num)] = set_rtt_timer()
     t = threading.Thread(target=check_retransmit, args=(flow,num,sp,))
@@ -140,10 +151,10 @@ def snoop_data(pkt):
   sp = IP(pkt.get_payload())
   ips = (sp["IP"].getfieldval('src'),sp["IP"].getfieldval('dst'))
   ports = (sp["TCP"].getfieldval('sport'),sp["IP"].getfieldval('dport'))
-  seqnum = sp["TCP"].getfieldval('seq')
+  seqnum = int(sp["TCP"].getfieldval('seq'))
   ## get the timestamp to also check for sequence number overflow
   # ('Timestamp',(Num,0))
-  ts = sp["TCP"].getfieldval('options')[2][1][0]
+  ts = int(sp["TCP"].getfieldval('options')[2][1][0])
   flow = (ips,ports)
 
   logger.debug("\tcurrent flow: %s" % str(flow))
@@ -200,8 +211,8 @@ def snoop_ack(pkt):
   sp = IP(pkt.get_payload())
   ips = (sp["IP"].getfieldval('src'),sp["IP"].getfieldval('dst'))
   ports = (sp["TCP"].getfieldval('sport'),sp["IP"].getfieldval('dport'))
-  acknum = sp["TCP"].getfieldval('ack')
-  ts = sp["TCP"].getfieldval('options')[2][1][0]
+  acknum = int(sp["TCP"].getfieldval('ack'))
+  ts = int(sp["TCP"].getfieldval('options')[2][1][0])
 
   flow = (ips,ports)
   inv_flow = ((ips[1],ips[0]),(ports[1],ports[0]))
@@ -261,10 +272,10 @@ def snoop_create(pkt):
   logger.debug("\tPORTS: %s" % str(ports))
   flow = (ips,ports)
   logger.debug("\tFLOW: %s" % str(flow))
-  seqnum = sp["TCP"].getfieldval('seq')
-  acknum = sp["TCP"].getfieldval('ack')
+  seqnum = int(sp["TCP"].getfieldval('seq'))
+  acknum = int(sp["TCP"].getfieldval('ack'))
   logger.debug("\tseq: %s, ack:%s" % (seqnum,acknum))
-  ts = sp["TCP"].getfieldval('options')[2][1][0]
+  ts = int(sp["TCP"].getfieldval('options')[2][1][0])
 
   if "SA" in sp.sprintf('%TCP.flags%'):
     if flow not in lastack:
@@ -342,18 +353,25 @@ def snoop(pkt):
     logger.debug("\tONLY ACK detected")
     snoop_ack(pkt)
   else:
+    """
     ips = (sp["IP"].getfieldval('src'),sp["IP"].getfieldval('dst'))
     ports = (sp["TCP"].getfieldval('sport'),sp["IP"].getfieldval('dport'))
-    seqnum = sp["TCP"].getfieldval('seq')
-    acknum = sp["TCP"].getfieldval('ack')
+    seqnum = int(sp["TCP"].getfieldval('seq'))
+    acknum = int(sp["TCP"].getfieldval('ack'))
     flow = (ips,ports)
     inv_flow = ((ips[1],ips[0]),(ports[1],ports[0]))
+
     logger.debug("last seq val: %s" % str(lastseq[flow][0]))
     logger.debug("last ack val: %s" % str(lastseq[inv_flow][0]))
     logger.debug("current  seq: %s" % str(seqnum))
     logger.debug("current  ack: %s" % str(acknum))
-    logger.debug("is data? %s" % ((seqnum > lastseq[flow][0] or seqnum < lastseq[flow][0]) and acknum == lastack[inv_flow][0]))
-    logger.debug("is piggy? %s" % ((seqnum > lastseq[flow][0] or seqnum < lastseq[flow][0]) and acknum == lastack[inv_flow][0]))
+    """
+
+    logger.debug("\tDATA detected")
+    ##FIXME: Not sure if this is fine, as for almost all data types we forward.
+    snoop_data(pkt)
+
+    """
     ##easiest way now to detect data is to check sequence number
     ## if seqnum >,< and ack doesnt change, then its only data
     if (seqnum > lastseq[flow][0]  or\
@@ -371,6 +389,7 @@ def snoop(pkt):
       #FIXME
       #snoop_ack(pkt)
       snoop_data(pkt)
+    """
 
 
 def print_and_accept(packet):
