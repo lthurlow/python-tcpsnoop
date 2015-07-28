@@ -8,6 +8,7 @@ import pprint
 import threading
 import pdb
 import sys
+
 ## because it is a shared lib
 sys.path.insert(0, "./netfilterlib/")
 from netfilterqueue import NetfilterQueue
@@ -34,10 +35,15 @@ logger.setLevel(logging.DEBUG)
 ## sudo iptables -I INPUT -i eth1 -j NFQUEUE --queue-num 1
 
 ## Run on snoop host:
-## sudo iptables -I INPUT -p tcp -i eth1 -j NFQUEUE --queue-num 1
 ## grab only tcp packets on interface eth1, and send them to userspace to be handled.
-## For debug with ping
-## sudo iptables -I OUTPUT -p icmp -i eth1 -j NFQUEUE --queue-num 1
+## for incoming traffic (from an1)
+## sudo iptables -I INPUT -p tcp -i eth1 -j NFQUEUE --queue-num 1
+## for outgoing traffic (from an2), if using routes, change to correct interface
+## sudo iptables -I OUTPUT -p tcp -o eth1 -j NFQUEUE --queue-num 1
+"""
+sudo iptables -I INPUT -p tcp -i eth1 -j NFQUEUE --queue-num 1
+sudo iptables -I OUTPUT -p tcp -o eth1 -j NFQUEUE --queue-num 1
+"""
 
 
 #this function will need to track all the snoop neccesary variables:
@@ -73,7 +79,7 @@ def check_retransmit(flow,num,sp):
 
 def set_rtt_timer():
   r = datetime.datetime.now()
-  r +=  datetime.timedelta(microsecond=10000)
+  r +=  datetime.timedelta(microseconds=10000)
   return r
 
 def accept_packet(pkt,flow,ts,num,ack_flag):
@@ -88,9 +94,9 @@ def accept_packet(pkt,flow,ts,num,ack_flag):
   else:
     dcache[(flow,num)] = sp
     lastseq[flow] = (num,ts)
-
-  transmit[(flow, num)] = set_rtt_timer()
-  t = threading.Thread(target=check_retransmit, args=(flow,num,sp,))
+    ## we could do this for all, but for now assumption is reciever is bad not sender
+    transmit[(flow, num)] = set_rtt_timer()
+    t = threading.Thread(target=check_retransmit, args=(flow,num,sp,))
   
 ## basic logic for tcp snoop:
 """
@@ -140,9 +146,9 @@ def snoop_data(pkt):
   ts = sp["TCP"].getfieldval('options')[2][1][0]
   flow = (ips,ports)
 
-  logger.debug("\tcurrent flow: %s" % flow)
+  logger.debug("\tcurrent flow: %s" % str(flow))
   ## this will be used when access the lastack dict for acks to our seqs
-  inv_flow = ((ips[1],ips[0]),(ips[1],ips[0]))
+  inv_flow = ((ips[1],ips[0]),(ports[1],ports[0]))
 
   logger.debug("\tlastack: %s" % lastseq)
   ## start by setting up the flow information
@@ -198,9 +204,9 @@ def snoop_ack(pkt):
   ts = sp["TCP"].getfieldval('options')[2][1][0]
 
   flow = (ips,ports)
-  inv_flow = ((ips[1],ips[0]),(ips[1],ips[0]))
+  inv_flow = ((ips[1],ips[0]),(ports[1],ports[0]))
 
-  logger.debug("\tnew flow: %s" % flow)
+  logger.debug("\tnew flow: %s" % str(flow))
   logger.debug("\tack: %s" % str(acknum))
 
   ## first ack in flow
@@ -250,19 +256,30 @@ def snoop_create(pkt):
 
   sp = IP(pkt.get_payload())
   ips = (sp["IP"].getfieldval('src'),sp["IP"].getfieldval('dst'))
+  logger.debug("\tIP: %s" % str(ips))
   ports = (sp["TCP"].getfieldval('sport'),sp["IP"].getfieldval('dport'))
+  logger.debug("\tPORTS: %s" % str(ports))
   flow = (ips,ports)
+  logger.debug("\tFLOW: %s" % str(flow))
   seqnum = sp["TCP"].getfieldval('seq')
   acknum = sp["TCP"].getfieldval('ack')
-  ts  =  sp.getfieldval('options')[2][1][0]
+  logger.debug("\tseq: %s, ack:%s" % (seqnum,acknum))
+  ts = sp["TCP"].getfieldval('options')[2][1][0]
 
-  if "A" in sp["TCP"].flags:
+  if "SA" in sp.sprintf('%TCP.flags%'):
+    if flow not in lastack:
+      lastack[flow] = (acknum,ts)
+    if flow not in lastseq:
+      lastseq[flow] = (seqnum,ts)
+  elif "A" in sp.sprintf('%TCP.flags%'):
     if flow not in lastack:
       lastack[flow] = (acknum,ts)
   else:
     if flow not in lastseq:
       lastseq[flow] = (seqnum,ts)
   pkt.accept()
+  logger.debug("lastseq: %s" % str(lastseq))
+  logger.debug("lastack: %s" % str(lastack))
 
          
 ## this function is called when a FIN pack comes through, we will clean
@@ -280,7 +297,7 @@ def snoop_clean(pkt):
   ports = (sp["TCP"].getfieldval('sport'),sp["IP"].getfieldval('dport'))
   flow = (ips,ports)
 
-  logger.debug("cleaning information for: %s" % flow)
+  logger.debug("cleaning information for: %s" % str(flow))
   ## I will not remove inv_flows, unless I recieve the FIN from that side as well
   for k in dcache:
     if flow == k[0]:
@@ -308,21 +325,52 @@ def snoop_clean(pkt):
 def snoop(pkt):
   logger.debug("SNOOP")
   sp = IP(pkt.get_payload())
+  logger.info("%s" % str(sp["TCP"].__repr__()))
+
+  ##FIXME: will eventually need to re-write all of this to not rely so heavily on flags
+  ##Tear down and create states
   ## if you see a F in flags it means FIN, clean up all connection info.
-  if "F" in sp["TCP"].flags:
+  logger.info("flags %s" % sp.sprintf('%TCP.flags%'))
+  if "F" in sp.sprintf('%TCP.flags%') or "R" in sp.sprintf('%TCP.flags%'):
     logger.debug("\tFIN detected, cleaning.")
     snoop_clean(pkt)
   ## create flow information in SYN rather than in ack and data.
-  elif "S" in sp["TCP"].flags:
+  elif "S" in sp.sprintf('%TCP.flags%'):
     logger.debug("\tSYN detected, creating flow.")
     snoop_create(pkt)
-  ## FIXME: need to be careful of piggyback acks, and seperate the two.
-  elif "A" in sp["TCP"].flags:
-    logger.debug("\tACK detected")
+  elif "A" == sp.sprintf('%TCP.flags%'):
+    logger.debug("\tONLY ACK detected")
     snoop_ack(pkt)
   else:
-    logger.debug("\tDATA detected")
-    snoop_data(pkt)
+    ips = (sp["IP"].getfieldval('src'),sp["IP"].getfieldval('dst'))
+    ports = (sp["TCP"].getfieldval('sport'),sp["IP"].getfieldval('dport'))
+    seqnum = sp["TCP"].getfieldval('seq')
+    acknum = sp["TCP"].getfieldval('ack')
+    flow = (ips,ports)
+    inv_flow = ((ips[1],ips[0]),(ports[1],ports[0]))
+    logger.debug("last seq val: %s" % str(lastseq[flow][0]))
+    logger.debug("last ack val: %s" % str(lastseq[inv_flow][0]))
+    logger.debug("current  seq: %s" % str(seqnum))
+    logger.debug("current  ack: %s" % str(acknum))
+    logger.debug("is data? %s" % ((seqnum > lastseq[flow][0] or seqnum < lastseq[flow][0]) and acknum == lastack[inv_flow][0]))
+    logger.debug("is piggy? %s" % ((seqnum > lastseq[flow][0] or seqnum < lastseq[flow][0]) and acknum == lastack[inv_flow][0]))
+    ##easiest way now to detect data is to check sequence number
+    ## if seqnum >,< and ack doesnt change, then its only data
+    if (seqnum > lastseq[flow][0]  or\
+        seqnum < lastseq[flow][0]) and acknum == lastack[inv_flow][0]:
+      logger.debug("\tONLY DATA detected")
+      snoop_data(pkt)
+    ###if seqnum == lastseq[flow][0] and\
+    #  (acknum  > lastack[flow][0]  or acknum < lastack[inv_flow][0]):
+    #  logger.debug("\tONLY ACK detected")
+    #  snoop_ack(pkt)
+    elif seqnum > lastseq[flow][0] and acknum > lastack[inv_flow][0]:
+      logger.debug("\tDATA + PIGGY")
+      ## this doesnt work, because I cant both accept and drop the packet.
+      ## if its data, always accept anyways
+      #FIXME
+      #snoop_ack(pkt)
+      snoop_data(pkt)
 
 
 def print_and_accept(packet):
@@ -348,7 +396,8 @@ def start_snoop(ilist,qname="NFQUEUE",qval=1):
 
 def debug():
   nfqueue = NetfilterQueue()
-  nfqueue.bind(1, print_and_accept)
+  #nfqueue.bind(1, print_and_accept)
+  nfqueue.bind(1, snoop)
   try:
     nfqueue.run()
   except Exception,e:
