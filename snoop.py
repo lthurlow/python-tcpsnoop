@@ -16,7 +16,7 @@ sys.path.append("scapy")
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 from scapy.all import *
 
-FORMAT = "[%(filename)s:%(lineno)s - %(threadName)s %(funcName)20s] %(levelname)10s %(message)s"
+FORMAT = "[%(filename)s:%(lineno)s - %(threadName)s %(funcName)10s] %(levelname)7s %(message)s"
 logging.basicConfig(format=FORMAT)
 logger = logging.getLogger("%s | %s | " % (os.getpid(), __file__) )
 logger.setLevel(logging.INFO)
@@ -49,10 +49,9 @@ sudo iptables -I OUTPUT -p tcp -o eth2 -m statistic --mode random --probability 
 
 
 ANHOST2:
-sudo iptables -I FORWARD -p tcp -i eth1 -j NFQUEUE --queue-num 1
-sudo iptables -A OUTPUT -p tcp -o eth2 -j NFQUEUE --queue-num 1
+sudo iptables -I FORWARD -i eth1 -j NFQUEUE --queue-num 1
+sudo iptables -I FORWARD -i eth2 -j NFQUEUE --queue-num 1
 
-sudo iptables -I FORWARD -p tcp -j NFQUEUE --queue-num 1
 
 
 ANHOST3:
@@ -82,23 +81,30 @@ lastseq = {}
 transmit = {}
 dupack = {}
 
-rtt = 100 #really around 500us
+rtt = 200 #really around 500us
 
 
-def check_retransmit(flow,num,sp):
+def check_retransmit(flow,num):
   logger.debug("RETRANSMIT")
   #sleep until rtt
   time.sleep(rtt/1000)
   #if (flow,num) in dcache:
   while (flow,num) in dcache:
     logger.info("\tpacket, not acked yet, resending:%s" % num)
-    send(sp)
+    send(dcache[(flow,num)])
     time.sleep(3*rtt/1000)
 
 def set_rtt_timer():
   r = datetime.datetime.now()
   r +=  datetime.timedelta(microseconds=10000)
   return r
+
+def print_accept():
+  logger.info("ACCEPTED")
+  logger.debug("----"*20)
+def print_drop():
+  logger.info("DISCARDED")
+  logger.debug("----"*20)
 
 def accept_packet(pkt,flow,ts,seqnum,acknum,ack_flag):
   global acache
@@ -107,7 +113,6 @@ def accept_packet(pkt,flow,ts,seqnum,acknum,ack_flag):
   global lastseq
   global transmit
 
-  logger.debug("ACCEPTING PACKET\n")
   pkt.accept()
   sp = IP(pkt.get_payload())
   ips = (sp["IP"].getfieldval('src'),sp["IP"].getfieldval('dst'))
@@ -118,33 +123,35 @@ def accept_packet(pkt,flow,ts,seqnum,acknum,ack_flag):
     acache[(inv_flow,acknum)] = sp
     lastack[inv_flow] = (acknum,ts)
     ## then clean out data cache thats been acknowledged
-    dcache.pop((flow,acknum-1),None)
-    if (flow,seqnum) in transmit:
-      transmit.pop((flow,acknum-1),None)
+    dcache.pop((inv_flow,acknum),None)
+    #if (flow,seqnum) in transmit:
+    #  transmit.pop((inv_flow,acknum),None)
 
   elif ack_flag==2:
     acache[(inv_flow,acknum)] = sp
     lastack[inv_flow] = (acknum,ts)
-    dcache.pop((flow,acknum-1),None)
-    if (flow,seqnum) in transmit:
-      transmit.pop((flow,acknum-1),None)
+    dcache.pop((inv_flow,acknum),None)
+    #if (flow,seqnum) in transmit:
+    #  transmit.pop((inv_flow,acknum),None)
 
     dcache[(flow,seqnum)] = sp
     lastseq[flow] = (seqnum,ts)
     ## we could do this for all, but for now assumption is reciever is bad not sender
-    transmit[(flow, seqnum)] = set_rtt_timer()
-    #t = threading.Thread(target=check_retransmit, args=(flow,seqnum,sp,))
-    #t.start()
+    if (flow,seqnum) not in transmit:
+      transmit[(flow, seqnum)] = set_rtt_timer()
+      #t = threading.Thread(target=check_retransmit, args=(flow,seqnum,))
+      #t.start()
   else:
     dcache[(flow,seqnum)] = sp
     lastseq[flow] = (seqnum,ts)
     ## we could do this for all, but for now assumption is reciever is bad not sender
     if (flow,seqnum) not in transmit:
-      transmit[(flow, seqnum)] = True
-      t = threading.Thread(target=check_retransmit, args=(flow,seqnum,sp,))
-      t.start()
+      transmit[(flow, seqnum)] = set_rtt_timer()
+      #t = threading.Thread(target=check_retransmit, args=(flow,seqnum,))
+      #t.start()
     else:
       logger.debug("thread still searching for ack: %s" % seqnum)
+  print_accept()
   
 ## basic logic for tcp snoop:
 """
@@ -226,6 +233,7 @@ def snoop_data(pkt):
       logger.debug("old transmit: %s" % transmit[(flow,seqnum)])
       transmit[(flow, seqnum)] = set_rtt_timer()
       pkt.accept()
+      print_accept()
     else:
       ## case 1
       ## if this sequence number is greater than the last we registered.
@@ -242,7 +250,9 @@ def snoop_data(pkt):
         #pdb.set_trace()
         #accept_packet(pkt,flow,ts,seqnum,0)
         send(acache[(inv_flow,acknum)])
+        logger.info("resend out of date data - sending ack: %s" % acknum)
         pkt.accept()
+        print_accept()
     
 """
 snoop_ack
@@ -264,6 +274,7 @@ def snoop_ack(pkt):
   ips = (sp["IP"].getfieldval('src'),sp["IP"].getfieldval('dst'))
   ports = (sp["TCP"].getfieldval('sport'),sp["IP"].getfieldval('dport'))
   acknum = int(sp["TCP"].getfieldval('ack'))
+  seqnum = int(sp["TCP"].getfieldval('seq'))
   ts = int(sp["TCP"].getfieldval('options')[2][1][0])
 
   flow = (ips,ports)
@@ -274,8 +285,9 @@ def snoop_ack(pkt):
 
   ## first ack in flow
   if inv_flow not in lastack:
-    logger.debug("\tflow first ack")
-    accept_packet(pkt,flow,ts,-1,acknum,1)
+    logger.debug("\tfirst flow ack")
+    lastseq[flow] = (seqnum,ts)
+    accept_packet(pkt,flow,ts,seqnum,acknum,1)
   else:
     lastacknum =  lastack[inv_flow][0]
     lastackts  =  lastack[inv_flow][1]
@@ -284,7 +296,7 @@ def snoop_ack(pkt):
     ## FIXME: fix seq overflow
     if acknum > lastacknum:
       logger.debug("\tupdate-accept")
-      accept_packet(pkt,flow,ts,-1,acknum,1)
+      accept_packet(pkt,flow,ts,seqnum,acknum,1)
     ## lower ack than what we have recieved
     else:
       logger.debug("\tacknowledgement out of date")
@@ -297,24 +309,28 @@ def snoop_ack(pkt):
           dupack[(flow,acknum)] = 1
           ## need to resend the data
           try:
+            logger.info("duplicate ack, resending data.")
             send(dcache[(flow,acknum)])
-            #transmit[(flow, acknum-1)] = set_rtt_timer()
             pkt.drop()
+            print_drop()
           except KeyError:
             logger.error("\tERROR-IN RESEND DATA")
             logger.info("dcache: %s" % dcache.keys())
             logger.info("problem using: (%s,%s)" % (flow,acknum)) 
             pkt.drop()
+            print_drop()
             
         ## if it already has a dup ack, we should drop it
         ## case 3
         else:
           logger.debug("Packet dropped.")
           pkt.drop()
+          print_drop()
       ## case 4
       else:
         logger.debug("Packet dropped.")
         pkt.drop()
+        print_drop()
  
 def snoop_create(pkt):
   global dcache
@@ -350,6 +366,7 @@ def snoop_create(pkt):
   pkt.accept()
   logger.debug("lastseq: %s" % str(lastseq))
   logger.debug("lastack: %s" % str(lastack))
+  print_accept()
 
          
 ## this function is called when a FIN pack comes through, we will clean
@@ -361,6 +378,7 @@ def snoop_clean(pkt):
   global lastack
   global transmit
   logger.debug("SNOOP_CLEAN")
+  pkt.accept()
 
   sp = IP(pkt.get_payload())
   ips = (sp["IP"].getfieldval('src'),sp["IP"].getfieldval('dst'))
@@ -370,12 +388,20 @@ def snoop_clean(pkt):
 
   logger.debug("cleaning information for: %s" % str(flow))
   ## I will not remove inv_flows, unless I recieve the FIN from that side as well
+
+
+  ##FIXME: Gotta fix the issues with dictionary changes while modifying
+  tcache = dcache
   for k in dcache:
     if flow == k[0]:
-      dcache.pop(k, None)
+      tcache.pop(k, None)
+  dcache = tcache
+  tcache = acache
   for k in acache:
     if flow == k[0]:
-      acache.pop(k, None)
+      tcache.pop(k, None)
+  acache = tcache
+  
   if flow in lastseq:
     lastseq.pop(flow, None)
   if flow in lastack:
@@ -388,7 +414,7 @@ def snoop_clean(pkt):
       dupack.pop(k, None)
 
   logger.debug("cleaning done.")
-  pkt.accept()
+  print_accept()
 
 #now generally this is working one way FH -> MH.
 #if the mobile host is sending data and loss is occuring, not much we
@@ -399,16 +425,13 @@ def snoop(pkt):
   #logger.info("%s" % str(sp["TCP"].__repr__()))
   seqnum = int(sp["TCP"].getfieldval('seq'))
   acknum = int(sp["TCP"].getfieldval('ack'))
+  ips = (sp["IP"].getfieldval('src'),sp["IP"].getfieldval('dst'))
 
   ##Tear down and create states
   ## if you see a F in flags it means FIN, clean up all connection info.
-  logger.info("\tflags: %s, seq: %s, ack: %s" % (sp.sprintf('%TCP.flags%'),seqnum,acknum))
-  try:
-    logger.debug("ack: %s, seq: %s" % (acknum, lastack[flow][0] ))
-    logger.debug("[flow] lack: %s, lseq: %s" % (lastack[flow][0],lastseq[flow][0] ))
-    #logger.debug("[invf] lack: %s, lseq: %s" % (lastack[inv_flow][0],lastseq[inv_flow][0] ))
-  except:
-    logger.debug("")
+  logger.info("\tflags: %3s | src:%s dst:%s | seq:%s ack:%s" %\
+     (sp.sprintf('%TCP.flags%'),str(ips[0]),str(ips[1]),seqnum,acknum))
+
   if "F" in sp.sprintf('%TCP.flags%') or "R" in sp.sprintf('%TCP.flags%'):
     logger.debug("\tFIN detected, cleaning.")
     snoop_clean(pkt)
@@ -419,10 +442,10 @@ def snoop(pkt):
     snoop_create(pkt)
     return
 
-  ips = (sp["IP"].getfieldval('src'),sp["IP"].getfieldval('dst'))
   ports = (sp["TCP"].getfieldval('sport'),sp["IP"].getfieldval('dport'))
   flow = (ips,ports)
   inv_flow = ((ips[1],ips[0]),(ports[1],ports[0]))
+  #pdb.set_trace()
   try:
     ## detecting first ack in tcp trace
     if inv_flow not in lastack:
@@ -472,6 +495,7 @@ def snoop(pkt):
         logger.error("seq: %s, lseq: %s, first:? %s"%(seqnum,lastseq[flow][0],first_pkt[flow]))
         logger.error("ack: %s, lack: %s" % (acknum, lastack[inv_flow][0] ))
         snoop_ack(pkt)
+        print_accept()
         #pkt.drop()
         return
   except Exception, e:
@@ -482,7 +506,7 @@ def snoop(pkt):
 
 
 def print_and_accept(packet):
-  print packet
+  #print packet
   sp = IP(packet.get_payload())
   packet.accept()
 
@@ -512,6 +536,7 @@ def debug():
     nfqueue.run()
   except Exception,e:
     logger.error("Error in Snoop start: %s" % str(e))
+  logger.info("stopped.")
 
 
 debug()
