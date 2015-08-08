@@ -198,7 +198,10 @@ class Cache:
       else:
         seq_want = self.cache[flow][seq_in.index(num)-1]
     except:
-      seq_want = self.cache[flow][seq_in.index(unack(flow))]
+      try:
+        seq_want = self.cache[flow][seq_in.index(self.unack(flow))]
+      except:
+        return None
     return seq_want
     
 
@@ -226,7 +229,13 @@ lastseq = {}
 transmit = {}
 dupack = {}
 
-rtt = 200 #really around 500us
+rtt = 30 #really around 500us
+
+def resend_data(seq,inv_flow,sp):
+  while not acache.get(inv_flow,seq):
+    logger.debug("resending lost data, seq: %s" % seq)
+    sendp(Ether(dst="00:00:00:00:00:22")/sp[IP], iface="eth2",verbose=0)
+    time.sleep(rtt/2000)
 
 # rtt = (a * old-rtt) + ((1-a)*new-rtt)
 def set_rtt(new_rtt):
@@ -290,6 +299,7 @@ def handle_sel_acks(pkt,flow,acks):
   found = False
   logger.debug("\tselective acks recieved: %s" % acks)
   for acknum in acks:
+    acknum -= 1
     if not acache.get(flow,acknum):
       logger.debug("unique: %s" % acknum)
       acache.insert(flow,acknum,sp)
@@ -314,15 +324,15 @@ def accept_packet(pkt,flow,seqnum,acknum,ack_flag):
 
   lastseq[flow] = (seqnum,acknum)
   if ack_flag==1:
-    acache.insert(flow,acknum,sp)
-    update_timer(flow,acknum)
+    acache.insert(flow,acknum-1,sp)
+    update_timer(flow,acknum-1)
     #dcache.remove(inv_flow,acknum)
 
   elif ack_flag==2:
     #dcache.remove(inv_flow,acknum)
-    acache.insert(flow,acknum,sp)
+    acache.insert(flow,acknum-1,sp)
     dcache.insert(flow,seqnum,sp)
-    update_timer(flow,acknum)
+    update_timer(flow,acknum-1)
     #try:
     #except Exception,e:
     #  logger.error("piggyback not working")
@@ -422,6 +432,8 @@ def snoop_data(pkt):
       print_drop()
     else:
       logger.debug("loss on link, accepting data packet, modifying transmit")
+      resend_thread = threading.Thread(target=resend_data,args=(seqnum,inv_flow,sp,))
+      resend_thread.start()
       pkt.accept()
       print_accept()
   else:
@@ -484,22 +496,24 @@ def snoop_ack(pkt):
     ## this would be duplicate acks
     sackfield = sp["TCP"].getfieldval("options")[-1]
     if sackfield[0] == "SAck":
-      acks = [x for x in sackfield[1]]
+      acks = [int(x)-1 for x in sackfield[1]]
       handle_sel_acks(pkt,flow,acks)
       ## if it is also not in dupack, then it is the first one.
       ## case 2
       if (flow,acknum) not in dupack:
         dupack[(flow,acknum)] = 1
-        missed = dcache.get_prev(inv_flow,acknum)
-        logger.debug("resending data: %s" % missed[0])
-        sendp(Ether(dst="00:00:00:00:00:22")/missed[1][IP], iface="eth2",verbose=0)
+        missed = dcache.get_prev(inv_flow,acknum-1)
+        if missed:
+          logger.debug("resending data: %s" % missed[0])
+          sendp(Ether(dst="00:00:00:00:00:22")/missed[1][IP], iface="eth2",verbose=0)
     ## normal dup ack
     elif acknum == lastacknum and seqnum == lastseq[flow][0]:
       if (flow,acknum) not in dupack:
         dupack[(flow,acknum)] = 1
-        missed = dcache.get_prev(inv_flow,acknum)
-        logger.debug("resending data: %s" % missed[0])
-        sendp(Ether(dst="00:00:00:00:00:22")/missed[1][IP], iface="eth2",verbose=0)
+        missed = dcache.get_prev(inv_flow,acknum-1)
+        if missed:
+          logger.debug("resending data: %s" % missed[0])
+          sendp(Ether(dst="00:00:00:00:00:22")/missed[1][IP], iface="eth2",verbose=0)
     ## case 3.5/4
     ## current ack < last seen ack
     elif acache.get(flow,acknum):
@@ -507,7 +521,7 @@ def snoop_ack(pkt):
       print_drop()
     else:
       ## out of order ack.
-      if dcache.get(inv_flow,acknum):
+      if dcache.get(inv_flow,acknum-1):
         accept_packet(pkt,flow,seqnum,acknum,1)
       ## more case 4
       else:
@@ -614,8 +628,8 @@ def snoop(pkt):
   if "F" in sp.sprintf('%TCP.flags%') or "R" in sp.sprintf('%TCP.flags%'):
     logger.debug("\tFIN detected, cleaning.")
     #snoop_clean(pkt)
-    pkt.accept()
-    return
+    #pkt.accept()
+    #return
   ## create flow information in SYN rather than in ack and data.
   elif "S" in sp.sprintf('%TCP.flags%'):
     logger.debug("\tSYN detected, creating flow.")
@@ -668,14 +682,14 @@ def snoop(pkt):
         if dcache.get(flow,seqnum):
           logger.debug("\t\tflow: %s, in dcache: %s, DATA" % (flow,dcache.get(flow,seqnum)))
           snoop_data(pkt)
-        elif acache.get(flow,acknum):
+        elif acache.get(flow,acknum-1):
           logger.debug("\t\tflow: %s, in acache: %s, ACK" % (flow,acache.get(flow,acknum)))
           snoop_ack(pkt)
         ## again our assumptions are that the data link side is not lossy, ack side is with iperf.
         else:
-          logger.error("flow: %s, inv_flow: %s" % (flow,inv_flow))
-          logger.error("seq: %s, ack: %s" % (seqnum,acknum))
-          if dcache.get(inv_flow,acknum):
+          logger.debug("flow: %s, inv_flow: %s" % (flow,inv_flow))
+          logger.debug("seq: %s, ack: %s" % (seqnum,acknum))
+          if dcache.get(inv_flow,acknum-1):
             snoop_ack(pkt)
           else:
             snoop_data(pkt)
