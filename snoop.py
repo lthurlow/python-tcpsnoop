@@ -33,7 +33,6 @@ logger.setLevel(logging.DEBUG)
 
 filelog = logging.FileHandler(filename='debug.out',mode='w')
 filelog.setFormatter(logging.Formatter(FORMAT))
-#filelog.addFilter(SingleLevelFilter(logging.DEBUG,False))
 filelog.setLevel(logging.DEBUG)
 logger.addHandler(filelog)
 
@@ -73,12 +72,9 @@ sudo iptables -I OUTPUT -p tcp -o eth1 -j NFQUEUE --queue-num 1
 sudo iptables -I INPUT -p tcp -i eth1 -j NFQUEUE --queue-num 1
 sudo iptables -I OUTPUT -p tcp -o eth2 -m statistic --mode random --probability 0.2 -j DROP
 
-
 ANHOST2:
 sudo iptables -I FORWARD -i eth1 -j NFQUEUE --queue-num 1
 sudo iptables -I FORWARD -i eth2 -j NFQUEUE --queue-num 1
-
-
 
 ANHOST3:
 sudo iptables -I INPUT -i eth2 -m statistic --mode random --probability 0.2 -j DROP
@@ -86,25 +82,25 @@ sudo iptables -I INPUT -i eth2 -m statistic --mode random --probability 0.2 -j D
 
 class Cache:
   cache = {}
+  unacked = {}
   def __init__(self):
     self.cache = {}
+  ##overwrite the string function for printing cache
   def __str__(self):
     stri = ""
     for f in self.cache:
       for x in self.cache[f]:
-        stri+=("%s: %s\n" % (f,x[0]))
+        stri+=("%s: %s (%s)\n" % (f,x[0],x[2]))
     ## peel off last newline
     if stri:
       return stri[:-1]
     else:
       return "Object empty"
-  def insert_data(self,flow,seq,pkt):
-    insert(self,flow,seq,pkt,"D")
-  def insert_ack(self,flow,seq,pkt):
-    insert(self,flow,seq,pkt,"A")
+  ## insert section, due to bisect, will keep the Cache seq's sorted by seq/acknum
   def insert(self, flow, seq, pkt):
+    r = datetime.datetime.now()
     if flow not in self.cache:
-      self.cache[flow] = [(seq,pkt)]
+      self.cache[flow] = [(seq,pkt,r)]
       return 0
     else:
       seq_in = [x[0] for x in self.cache[flow]]
@@ -112,12 +108,13 @@ class Cache:
         if seq not in seq_in:
           bisect.insort(seq_in,seq)
           ti = seq_in.index(seq)
-          self.cache[flow].insert(ti,(seq,pkt))
+          self.cache[flow].insert(ti,(seq,pkt,r))
           return ti
       else:
-        self.cache[flow] = [(seq,pkt)]
+        self.cache[flow] = [(seq,pkt,r)]
         return 0
     return None
+  ## remove an element from the cache
   def remove(self,flow,seq):
     if flow in self.cache:
       seq_in = [x[0] for x in self.cache[flow]]
@@ -126,6 +123,7 @@ class Cache:
         self.cache[flow].remove(self.cache[flow][ti])
         return ti 
     return None
+  ## return the cache entry, (seq,pkt,ts)
   def get(self,flow,seq):
     if flow in self.cache:
       seq_in = [x[0] for x in self.cache[flow]]
@@ -133,15 +131,76 @@ class Cache:
         ti = seq_in.index(seq)
         return self.cache[flow][ti]
     return None
+  ## will return all of the flows stored in the cache
   def getkeys(self):
     return self.cache.keys()
+  ## will delete a flow from the cache
   def clean(self,flow):
     self.cache.pop(flow,None)
+  # will return all of the packets in a flow
   def flush(self,flow):
     ld = []
     for data in self.cache[flow]:
       ld.append(data[1])
     return ld
+  ## test if a flow is in a cache
+  def getflow(self,flow):
+    if flow in self.cache.keys():
+      return True
+    else:
+      return False
+  ## will modify the flow to change ts to None if applicable, it will
+  ## also return the time since creation, and the udpate call
+  def update(self,flow,seq):
+    seq_in = [x[0] for x in self.cache[flow]]
+    if seq in seq_in:
+      ti = seq_in.index(seq)
+      r = datetime.datetime.now()
+      ts = self.cache[flow][ti][2]
+      item = self.cache[flow][ti]
+      self.cache[flow][ti] = (item[0],item[1],None)
+      if ts:
+        return (r-ts).total_seconds()
+      else:
+        return None
+    return None
+  ## resend will look at the last 10 packets, and will resend it if the rtt value
+  ## passes a threshold over the smoothed rtt value
+  def resend(self,flow,rtt):
+    r = datetime.datetime.now()
+    for x in self.cache[flow][:-10]:
+      #pdb.set_trace()
+      if x[2] != None:
+        if (r-x[2]).total_seconds()*1000 > 3*rtt:
+          sendp(Ether(dst="00:00:00:00:00:22")/(x[1])[IP], iface="eth2",verbose=0)
+        self.cache[flow][self.cache[flow].index(x)] = (x[0],x[1],r)  
+    return
+  ## this function will be used to return the first unacked packet
+  def unack(self,flow):
+    if flow not in self.unacked:
+      self.unacked[flow] = -1
+    seq_in = []
+    if self.unacked[flow] != -1:
+      seq_in = [x[0] for x in self.cache[flow][self.unacked[flow]:]]
+    else:
+      seq_in = [x[0] for x in self.cache[flow]]
+    for seq in seq_in:
+      if self.cache[flow][seq_in.index(seq)][2] != None:
+        ## dont think this will get messed up by insert
+        self.unacked[flow] = seq_in.index(seq)
+        return self.cache[flow][seq_in.index(seq)][0]
+    return None
+  def get_prev(self,flow,num):
+    seq_in = [x[0] for x in self.cache[flow]]
+    try:
+      if seq_in.index(num) <= 1:
+        seq_want = self.cache[flow][0]
+      else:
+        seq_want = self.cache[flow][seq_in.index(num)-1]
+    except:
+      seq_want = self.cache[flow][seq_in.index(unack(flow))]
+    return seq_want
+    
 
 #this function will need to track all the snoop neccesary variables:
 # such as if it is tcp, what byte is being acknowledge, what the last byte  ack was
@@ -169,23 +228,31 @@ dupack = {}
 
 rtt = 200 #really around 500us
 
-def check_retransmit(flow,num):
-  logger.debug("RETRANSMIT")
-  #sleep until rtt
-  time.sleep(rtt/1000)
-  #if (flow,num) in dcache:
-  """
-  while (flow,num) in dcache:
-    logger.info("\tpacket, not acked yet, resending:%s" % num)
-    send(dcache[(flow,num)])
-    time.sleep(3*rtt/1000)
-  """
+# rtt = (a * old-rtt) + ((1-a)*new-rtt)
+def set_rtt(new_rtt):
+  global rtt
+  ## make it into milliseconds
+  logger.debug("old rtt: %s, passed in: %s" % (rtt,new_rtt))
+  new_rtt = new_rtt * 1000
+  rtt = (.9*rtt) + ((1-.9) * new_rtt)
+  logger.debug("updated rtt: %s" % rtt)
+  return 
 
-
-def set_rtt_timer():
-  r = datetime.datetime.now()
-  r +=  datetime.timedelta(microseconds=rtt*1000)
-  return r
+## we will call update on dcache, this both returns us
+## the time it has taken since the packet was inserted in the 
+## datacache and the current time, for an rtt.
+def update_timer(flow,num):
+  global dcache
+  #if dcache.get(flow,num)[2] != None:
+  inv_flow = ((flow[0][::-1]),(flow[1][::-1]))
+  try:
+    new_rtt = dcache.update(inv_flow,num)
+    if new_rtt:
+      set_rtt(new_rtt)
+    #dcache.resend(inv_flow,rtt)
+  except:
+    logger.error("Looks like key missing - fine if after FIN")
+  return
 
 def print_accept():
   logger.info("ACCEPTED")
@@ -198,7 +265,7 @@ def print_drop():
 
 ## instead of sending out SACKs across good link, send individual ack's
 def send_ack(sp,acknum):
-  logger.debug("SEND ACK")
+  logger.debug("SEND_ACK")
   pkt = IP(version=4L,ihl=5L,tos=0x0,len=52,id=sp[IP].id,flags="DF",frag=0L,ttl=sp[IP].ttl,\
         proto="tcp",src=sp[IP].src,dst=sp[IP].dst,options=[])/\
         TCP(sport=sp[TCP].sport,dport=sp[TCP].dport,seq=sp[TCP].seq,ack=acknum,dataofs=8L,\
@@ -207,12 +274,12 @@ def send_ack(sp,acknum):
   
   del sp[TCP].chksum
   del sp[IP].chksum
+  ## this will re-generate the checksums for IP/TCP
   pkt = pkt.__class__(str(pkt))
-  #pdb.set_trace()
   ## FIXME
-  sendp(Ether(dst="00:00:00:00:00:01")/pkt[IP]/pkt[TCP], iface="eth1",verbose=0)
-  logger.debug("sent modified ack: %s" % acknum)
-  logger.debug("pkt:\n%s" % pkt[TCP].__repr__())
+  sendp(Ether(dst="00:00:00:00:00:01")/pkt[IP], iface="eth1",verbose=0)
+  logger.debug("sent ACK: %s" % acknum)
+  #logger.debug("pkt:\n%s" % pkt[TCP].__repr__())
 
 def handle_sel_acks(pkt,flow,acks):
   logger.debug("HANDLE SELECTIVE ACKS")
@@ -222,27 +289,22 @@ def handle_sel_acks(pkt,flow,acks):
   sp = IP(pkt.get_payload())
   found = False
   logger.debug("\tselective acks recieved: %s" % acks)
-  found = False
   for acknum in acks:
-    if dcache.get(inv_flow,acknum):
+    if not acache.get(flow,acknum):
+      logger.debug("unique: %s" % acknum)
       acache.insert(flow,acknum,sp)
-      dcache.remove(inv_flow,acknum)
+      update_timer(flow,acknum)
       send_ack(sp,acknum)
-      found = True
+
+  logger.info("Duplicate Ack: SACKS")
   pkt.drop()
-  if found:
-    print_accept()
-  else:
-    print_drop()
   logger.debug("\tdcache updated:\n%s" % dcache)
   logger.debug("\tacache updated:\n%s" % acache)
 
 
 def accept_packet(pkt,flow,seqnum,acknum,ack_flag):
-  global acache
-  global dcache
   global lastseq
-  global transmit
+
   logger.debug("ACCEPT PACKET")
   pkt.accept()
   sp = IP(pkt.get_payload())
@@ -253,12 +315,19 @@ def accept_packet(pkt,flow,seqnum,acknum,ack_flag):
   lastseq[flow] = (seqnum,acknum)
   if ack_flag==1:
     acache.insert(flow,acknum,sp)
-    dcache.remove(inv_flow,acknum)
+    update_timer(flow,acknum)
+    #dcache.remove(inv_flow,acknum)
 
   elif ack_flag==2:
-    dcache.remove(inv_flow,acknum)
+    #dcache.remove(inv_flow,acknum)
     acache.insert(flow,acknum,sp)
     dcache.insert(flow,seqnum,sp)
+    update_timer(flow,acknum)
+    #try:
+    #except Exception,e:
+    #  logger.error("piggyback not working")
+    #  logger.error(traceback.format_exc())
+      
     ## we could do this for all, but for now assumption is reciever is bad not sender
     """
     if (flow,seqnum) not in transmit:
@@ -276,6 +345,7 @@ def accept_packet(pkt,flow,seqnum,acknum,ack_flag):
     """
   logger.debug("dcache:\n%s" % dcache)
   logger.debug("acache:\n%s" % acache)
+  logger.debug("rtt: %s"% str(rtt))
   print_accept()
   
 ## basic logic for tcp snoop:
@@ -339,49 +409,38 @@ def snoop_data(pkt):
     logger.debug("\tPiggybacked ACK")
     ack_flag = 2
 
-  ## start by setting up the flow information
-  ##verify
-  if inv_flow not in lastseq:
-    logger.debug("flow not yet ack'd in lastseq.")
-    logger.error("should be handled in snoop_create now.")
-    ## forward it
-    accept_packet(pkt,flow,seqnum,acknum,ack_flag)
-  ## we have atleast seen 1 packet recently from source/dst
-  else:
-    ## case 3
-    ## there was loss on our FH link, and congestion
-    #if (flow,seqnum) in dcache:
-    if dcache.get(flow,seqnum):
+  ## case 2
+  ## there was loss on our FH link, and congestion
+  #if (flow,seqnum) in dcache:
+  if dcache.get(flow,seqnum):
+    ## first lets see if we already acked it
+    ## Case 2b
+    if acache.get(inv_flow,seqnum):
+      ##FIXME
+      sendp(Ether(dst="00:00:00:00:00:22")/sp[IP], iface="eth2",verbose=0)
+      pkt.drop()
+      print_drop()
+    else:
       logger.debug("loss on link, accepting data packet, modifying transmit")
-      #logger.debug("old transmit: %s" % transmit[(flow,seqnum)])
-      #transmit[(flow, seqnum)] = set_rtt_timer()
       pkt.accept()
       print_accept()
+  else:
+    ## case 1
+    ## if this sequence number is greater than the last we registered.
+    ## FIXME: Rollover seqnum
+    if seqnum > prev_seq:
+      logger.debug("\thigher seqnum, accepting")
+      accept_packet(pkt,flow,seqnum,acknum,ack_flag)
+    ## out of order data packet
+    ## case 3
     else:
-      ## case 1
-      ## if this sequence number is greater than the last we registered.
-      ## FIXME: Rollover seqnum
-      if seqnum > prev_seq:
-        logger.debug("\thigher seqnum, accepting")
-        accept_packet(pkt,flow,seqnum,acknum,ack_flag)
-      ##seqnum < lastseq[flow][0]
-      else:
-        ## case 2b
-        logger.debug("recieved old data pkt, resending last ack back to sender")
-        logger.debug("using: (%s,%s)" % (inv_flow,seqnum)) 
-        #accept_packet(pkt,flow,ts,seqnum,0)
-        #send(acache.get(inv_flow,seqnum)[1])
-        ##FIXME
-        packet = acache.get(inv_flow,seqnum)[1]
-        sendp(Ether(dst="00:00:00:00:00:22")/packet[IP]/packet[TCP], iface="eth2",verbose=0)
-
-        acache.remove(inv_flow,seqnum)
-        dcache.insert(flow,seqnum,sp)
-        
-        logger.debug("resend out of date data - sending ack: %s" % seqnum)
-        pkt.accept()
-        print_accept()
-    
+      logger.debug("recieved old packet")
+      logger.debug("using: (%s,%s)" % (inv_flow,seqnum)) 
+      dcache.insert(flow,seqnum,sp)
+      pkt.accept()
+      logger.debug("resend out of date data - sending ack: %s" % seqnum)
+      print_accept()
+  
 """
 snoop_ack
 MH -> BS -> FH
@@ -412,25 +471,6 @@ def snoop_ack(pkt):
   logger.debug("\tflow: %s" % str(flow))
   logger.debug("\tack: %s" % str(acknum))
 
-  ## check for non-acked data first
-  if dcache.get(inv_flow,acknum):
-    accept_packet(pkt,flow,seqnum,acknum,1)
-    return
-
-  ## first ack in flowk
-  ##verify
-  """
-  if first_pkt[inv_flow]:
-    first_pkt[inv_flow] = False
-    logger.debug("\tfirst flow ack")
-    lastseq[flow] = (seqnum,acknum)
-
-    dcache.remove(inv_flow,acknum-1)
-    acache.insert(flow,acknum,sp)
-    pkt.accept()
-    print_accept()
-  else:
-  """
   lastacknum =  lastseq[flow][1]
   logger.debug("\tlast ack: ack %s" % (lastacknum))
   ## this is a newer ack we have recieved
@@ -441,39 +481,39 @@ def snoop_ack(pkt):
   else:
     logger.debug("pkt:\n%s" % sp["TCP"].__repr__())
     ## check for SAck in packet
+    ## this would be duplicate acks
     sackfield = sp["TCP"].getfieldval("options")[-1]
     if sackfield[0] == "SAck":
       acks = [x for x in sackfield[1]]
       handle_sel_acks(pkt,flow,acks)
+      ## if it is also not in dupack, then it is the first one.
+      ## case 2
+      if (flow,acknum) not in dupack:
+        dupack[(flow,acknum)] = 1
+        missed = dcache.get_prev(inv_flow,acknum)
+        logger.debug("resending data: %s" % missed[0])
+        sendp(Ether(dst="00:00:00:00:00:22")/missed[1][IP], iface="eth2",verbose=0)
+    ## normal dup ack
+    elif acknum == lastacknum and seqnum == lastseq[flow][0]:
+      if (flow,acknum) not in dupack:
+        dupack[(flow,acknum)] = 1
+        missed = dcache.get_prev(inv_flow,acknum)
+        logger.debug("resending data: %s" % missed[0])
+        sendp(Ether(dst="00:00:00:00:00:22")/missed[1][IP], iface="eth2",verbose=0)
+    ## case 3.5/4
+    ## current ack < last seen ack
+    elif acache.get(flow,acknum):
+      pkt.drop()
+      print_drop()
     else:
-      ## if we have already seen ack, then it must be a duplicate
-      if acknum == lastacknum:
-        ## if it is also not in dupack, then it is the first one.
-        ## case 2
-        if (flow,acknum) not in dupack:
-          dupack[(flow,acknum)] = 1
-          ## need to resend the data
-          logger.debug("first duplicate ack, resending data.")
-          ## flush data cache
-          backed = dcache.flush(flow)
-          for d in backed:
-            #send(d)
-            ##FIXME
-            sendp(Ether(dst="00:00:00:00:00:22")/d[IP]/d[TCP], iface="eth2",verbose=0)
-          pkt.drop()
-          print_drop()
-        ## if it already has a dup ack, we should drop it
-        ## case 3
-        else:
-          logger.debug("multiple duplicate ack. dropping.")
-          pkt.drop()
-          print_drop()
-      ## case 4
-      ## current ack < last seen ack
+      ## out of order ack.
+      if dcache.get(inv_flow,acknum):
+        accept_packet(pkt,flow,seqnum,acknum,1)
+      ## more case 4
       else:
-        logger.debug("Packet dropped.")
         pkt.drop()
         print_drop()
+        
  
 def snoop_create(pkt):
   global dcache
@@ -591,6 +631,7 @@ def snoop(pkt):
     fin_hand[flow] = True
     fin_hand[inv_flow] = True
     first_pkt[flow] = True
+    first_pkt[inv_flow] = True
     return
 
   try:
@@ -602,11 +643,13 @@ def snoop(pkt):
     ## if seqnum is less or greather than previous, we will accept and forward
     if seqnum > prev_seq:
       logger.debug("\tData detected")
+      first_pkt[flow] = False
       ## snoop data will catch the piggys
       snoop_data(pkt)
       return
     elif acknum > prev_ack:
       logger.debug("\tACK")
+      first_pkt[flow] = False
       snoop_ack(pkt)
       return
     ## if the acknum is greater or less than, we will accept greater and reject lower
@@ -615,7 +658,10 @@ def snoop(pkt):
         ##FIXME, this packet never gets acked.
         logger.debug("\tFirst Packet")
         first_pkt[flow] = False
-        accept_packet(pkt,flow,seqnum,acknum,0)
+        if first_pkt[inv_flow]:
+          accept_packet(pkt,flow,seqnum,acknum,0)
+        else:
+          accept_packet(pkt,flow,seqnum,acknum,1)
         return
       else:
         logger.debug("Out of date.")
@@ -625,13 +671,14 @@ def snoop(pkt):
         elif acache.get(flow,acknum):
           logger.debug("\t\tflow: %s, in acache: %s, ACK" % (flow,acache.get(flow,acknum)))
           snoop_ack(pkt)
-        ## if its not in acache it must be data, 
-        ## because we clear dcache, but not achace
+        ## again our assumptions are that the data link side is not lossy, ack side is with iperf.
         else:
-          logger.error("OH NOES!")
           logger.error("flow: %s, inv_flow: %s" % (flow,inv_flow))
           logger.error("seq: %s, ack: %s" % (seqnum,acknum))
-          snoop_data(pkt)
+          if dcache.get(inv_flow,acknum):
+            snoop_ack(pkt)
+          else:
+            snoop_data(pkt)
 
 
   except Exception, e:
@@ -643,7 +690,8 @@ def snoop(pkt):
 
 
 def print_and_accept(packet):
-  print packet
+  #print packet
+  #pdb.set_trace()
   sp = IP(packet.get_payload())
   logger.debug("%s:%s -> %s:%s" % (sp[IP].src,sp[TCP].sport,sp[IP].dst,sp[TCP].dport))
   packet.accept()
@@ -674,6 +722,7 @@ def debug():
     nfqueue.run()
   except Exception,e:
     logger.error("Error in Snoop start: %s" % str(e))
+    logger.error(traceback.format_exc())
   logger.info("stopped.")
 
 
